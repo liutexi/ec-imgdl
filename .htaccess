@@ -1,0 +1,21 @@
+# 云湖图片下载器 · Apache 配置
+# Nginx 用户不会读取本文件，可忽略（见 README 里的 Nginx 说明）
+# 如果上传后整站报 500，说明主机禁用了 .htaccess 里的指令，直接删掉本文件即可
+
+DirectoryIndex index.php
+
+# 禁止目录列表（防止别人浏览 cache 里的文件）
+<IfModule mod_autoindex.c>
+  Options -Indexes
+</IfModule>
+
+# 配置文件与链接清单不允许直接下载
+<FilesMatch "^(config\.php|urls\.txt|README\.md)$">
+  <IfModule mod_authz_core.c>
+    Require all denied
+  </IfModule>
+  <IfModule !mod_authz_core.c>
+    Order allow,deny
+    Deny from all
+  </IfModule>
+</FilesMatch>
