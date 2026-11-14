@@ -49,7 +49,7 @@ if (!function_exists('str_contains')) {
 @ini_set('display_errors', '0');   // 线上不要把 PHP 报错混进 JSON 响应，错误仍进日志
 
 /* ==================== 版本 ==================== */
-define('IMGDL_VERSION', 'V0.0.2');
+define('IMGDL_VERSION', 'V0.0.3');
 
 /* ==================== 配置 ==================== */
 // 默认值；线上要改的放在同目录 config.php 里，避免升级主程序时被覆盖
@@ -663,6 +663,376 @@ function imgdl_extract_urls(string $text): array
     return array_keys($out);
 }
 
+/**
+ * 输出 API 文档页。与主界面共用同一套视觉变量，保证风格一致。
+ */
+function imgdl_render_docs(): void
+{
+    $ver    = IMGDL_VERSION;
+    $https  = isset($_SERVER['HTTPS']) && strtolower((string)$_SERVER['HTTPS']) !== 'off';
+    $dir    = rtrim(str_replace('\\', '/', dirname((string)($_SERVER['SCRIPT_NAME'] ?? '/index.php'))), '/');
+    $origin = ($https ? 'https' : 'http') . '://' . (string)($_SERVER['HTTP_HOST'] ?? 'localhost') . $dir . '/';
+
+    $html = <<<'HTML'
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>API 文档 · 云湖图片下载器</title>
+<style>
+  :root{
+    --bg:#f4f6fb; --card:#fff; --tx:#182132; --tx2:#6b7688; --tx3:#9aa4b4;
+    --line:#e6eaf2; --acc:#4f7cff; --acc2:#3b66e8; --ok:#12b886; --err:#ef4a4a; --warn:#f0a020;
+    --code:#f7f9fc;
+    --sh:0 1px 2px rgba(24,33,50,.04), 0 8px 24px rgba(24,33,50,.06);
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --bg:#101319; --card:#181c25; --tx:#e7ecf5; --tx2:#8e99ab; --tx3:#697384;
+      --line:#252b37; --code:#12151c;
+      --sh:0 1px 2px rgba(0,0,0,.4), 0 8px 28px rgba(0,0,0,.35);
+    }
+  }
+  html[data-theme="dark"]{
+    --bg:#101319; --card:#181c25; --tx:#e7ecf5; --tx2:#8e99ab; --tx3:#697384;
+    --line:#252b37; --code:#12151c;
+    --sh:0 1px 2px rgba(0,0,0,.4), 0 8px 28px rgba(0,0,0,.35);
+  }
+  html[data-theme="light"]{
+    --bg:#f4f6fb; --card:#fff; --tx:#182132; --tx2:#6b7688; --tx3:#9aa4b4;
+    --line:#e6eaf2; --code:#f7f9fc;
+    --sh:0 1px 2px rgba(24,33,50,.04), 0 8px 24px rgba(24,33,50,.06);
+  }
+  *{box-sizing:border-box}
+  [hidden]{display:none !important}
+  html,body{margin:0}
+  body{
+    background:var(--bg); color:var(--tx);
+    font:14px/1.6 -apple-system,"Segoe UI",system-ui,"Microsoft YaHei",sans-serif;
+    padding:28px 20px 64px; -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:1000px;margin:0 auto}
+
+  /* 顶栏：与主界面同一套尺寸，图标 30px + 标题 */
+  .dtop{display:flex;align-items:center;gap:10px;margin-bottom:24px}
+  .dtop h1{font-size:22px;margin:0;letter-spacing:-.3px;display:flex;align-items:center;gap:10px}
+  .dtop h1 .bg{width:30px;height:30px;border-radius:9px;background:linear-gradient(135deg,#5b86ff,#3b66e8);
+    display:grid;place-items:center;flex:none;box-shadow:0 4px 12px rgba(79,124,255,.35)}
+  .dtop h1 .bg svg{width:16px;height:16px;stroke:#fff;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+  .ver{font-size:11.5px;color:var(--tx3);border:1px solid var(--line);padding:2px 9px;border-radius:20px;
+    background:var(--card);flex:none;font-variant-numeric:tabular-nums}
+  .tlink{margin-left:auto;flex:none;font-size:12.5px;color:var(--tx2);text-decoration:none;
+    padding:6px 13px;border:1px solid var(--line);border-radius:8px;transition:.15s;background:var(--card)}
+  .tlink:hover{color:var(--tx);border-color:#c3cee3}
+
+  /* 双栏：左侧导航 180px，右侧内容 */
+  .dgrid{display:grid;grid-template-columns:180px minmax(0,1fr);gap:28px;align-items:start}
+  .dnav{position:sticky;top:24px;display:flex;flex-direction:column;gap:1px;padding-top:6px}
+  .dnav-t{font-size:11px;color:var(--tx3);letter-spacing:.4px;padding:0 12px 6px}
+  .dnav a{font-size:13px;color:var(--tx2);text-decoration:none;padding:7px 12px;border-radius:8px;
+    transition:.13s;border:1px solid transparent}
+  .dnav a:hover{background:var(--card);color:var(--tx);border-color:var(--line)}
+
+  .sec{background:var(--card);border:1px solid var(--line);border-radius:14px;box-shadow:var(--sh);
+    padding:20px 22px;margin-bottom:16px;scroll-margin-top:20px}
+  .sec h2{font-size:15px;margin:0 0 8px;font-weight:500;letter-spacing:-.2px}
+  .sec h4{font-size:12px;margin:16px 0 6px;font-weight:500;color:var(--tx3);letter-spacing:.3px}
+  .sec p{margin:0;font-size:13px;color:var(--tx2);line-height:1.7}
+  .sec p + p{margin-top:8px}
+
+  code{font-family:ui-monospace,Consolas,"Microsoft YaHei",monospace;font-size:12px;
+    background:rgba(79,124,255,.09);color:var(--acc2);padding:1px 6px;border-radius:5px}
+  pre{background:var(--code);border:1px solid var(--line);border-radius:10px;padding:13px 15px;
+    overflow-x:auto;margin:8px 0 0;font:12.5px/1.7 ui-monospace,Consolas,"Microsoft YaHei",monospace;
+    color:var(--tx);tab-size:2}
+  pre code{background:none;color:inherit;padding:0;font-size:inherit;border-radius:0}
+
+  .tbl{width:100%;border-collapse:collapse;font-size:12.5px;margin-top:8px}
+  .tbl th{text-align:left;color:var(--tx3);font-weight:500;padding:6px 10px 6px 0;
+    border-bottom:1px solid var(--line);font-size:11.5px;white-space:nowrap}
+  .tbl td{padding:7px 10px 7px 0;border-bottom:1px solid var(--line);vertical-align:top;color:var(--tx2);line-height:1.6}
+  .tbl tr:last-child td{border-bottom:none}
+  .tbl td:first-child{color:var(--tx);font-family:ui-monospace,Consolas,monospace;font-size:12px;white-space:nowrap}
+  .tbl td:first-child .req{color:var(--err)}
+
+  .eph{display:flex;align-items:center;gap:9px;margin-bottom:8px}
+  .tag{font-size:10.5px;font-weight:500;letter-spacing:.4px;padding:2px 8px;border-radius:5px;flex:none}
+  .tag.get{background:rgba(18,184,134,.12);color:#0e8f6b}
+  .tag.post{background:rgba(79,124,255,.12);color:var(--acc2)}
+  .path{font-family:ui-monospace,Consolas,monospace;font-size:12.5px;color:var(--tx)}
+
+  .note{display:flex;gap:9px;align-items:flex-start;margin-top:12px;padding:10px 14px;border-radius:10px;
+    font-size:12.5px;line-height:1.6;color:#8a5a00;background:rgba(240,160,32,.09);
+    border:1px solid rgba(240,160,32,.28)}
+  .note svg{flex:none;margin-top:2px}
+  @media (prefers-color-scheme: dark){
+    .note{color:#f0b85c}
+    code{color:#8ab4ff;background:rgba(79,124,255,.16)}
+    .tag.get{background:rgba(18,184,134,.18);color:#4fd1a5}
+    .tag.post{background:rgba(79,124,255,.2);color:#8ab4ff}
+  }
+  html[data-theme="dark"] .note{color:#f0b85c}
+  html[data-theme="dark"] code{color:#8ab4ff;background:rgba(79,124,255,.16)}
+  html[data-theme="dark"] .tag.get{background:rgba(18,184,134,.18);color:#4fd1a5}
+  html[data-theme="dark"] .tag.post{background:rgba(79,124,255,.2);color:#8ab4ff}
+
+  .foot{text-align:center;font-size:11.5px;color:var(--tx3);margin:26px 0 0}
+
+  @media (max-width:760px){
+    body{padding:20px 14px 50px}
+    .dgrid{grid-template-columns:minmax(0,1fr);gap:16px}
+    .dnav{position:static;flex-direction:row;overflow-x:auto;padding-bottom:6px;gap:4px;min-width:0}
+    .dnav-t{display:none}
+    .dnav a{white-space:nowrap;border-color:var(--line);background:var(--card);flex:none}
+    .sec{padding:16px 16px}
+    .dtop{flex-wrap:wrap;gap:8px}
+    .dtop h1{font-size:19px}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="dtop">
+    <h1>
+      <span class="bg"><svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="M8 13h8M8 17h5"/></svg></span>
+      API 文档
+    </h1>
+    <span class="ver">{{VER}}</span>
+    <a class="tlink" href="./">返回下载器</a>
+  </div>
+
+  <div class="dgrid">
+    <nav class="dnav">
+      <div class="dnav-t">接口目录</div>
+      <a href="#overview">概览</a>
+      <a href="#auth">鉴权</a>
+      <a href="#extract">解析链接</a>
+      <a href="#batch">下载一批</a>
+      <a href="#raw">预览原图</a>
+      <a href="#dl">下载单张</a>
+      <a href="#zip">打包 ZIP</a>
+      <a href="#local">读取 urls.txt</a>
+      <a href="#login">口令登录</a>
+      <a href="#logout">退出</a>
+      <a href="#errors">错误与限制</a>
+    </nav>
+
+    <main>
+      <section class="sec" id="overview">
+        <h2>概览</h2>
+        <p>所有接口用查询参数 <code>?a=</code> 区分。除图片和 ZIP 外，都返回 <code>application/json; charset=utf-8</code>。</p>
+        <table class="tbl">
+          <tr><th>接口</th><th>方法</th><th>用途</th></tr>
+          <tr><td>?a=extract</td><td>POST</td><td>只解析链接，返回地址列表</td></tr>
+          <tr><td>?a=batch</td><td>POST</td><td>下载一批链接（前端按批调用）</td></tr>
+          <tr><td>?a=raw&amp;k=</td><td>GET</td><td>返回图片原始字节（预览用）</td></tr>
+          <tr><td>?a=dl&amp;k=</td><td>GET</td><td>以附件形式下载单张</td></tr>
+          <tr><td>?a=zip&amp;k=</td><td>GET</td><td>把多张打包成 ZIP</td></tr>
+          <tr><td>?a=local</td><td>GET</td><td>读取程序目录下的 urls.txt</td></tr>
+          <tr><td>?a=login</td><td>POST</td><td>口令登录</td></tr>
+          <tr><td>?a=logout</td><td>GET</td><td>清除登录状态</td></tr>
+        </table>
+        <div class="note">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 16v-4M12 8h.01"/></svg>
+          <div>示例里的基址是 <code>{{ORIGIN}}</code>，部署位置不同的话替换掉。程序内部全用相对路径，放子目录也能用。</div>
+        </div>
+      </section>
+
+      <section class="sec" id="auth">
+        <h2>鉴权</h2>
+        <p>默认不校验，拿到地址就能调。在 <code>config.php</code> 里设了 <code>password</code> 或 <code>access_key</code> 之后，除 <code>?a=login</code> 外都要先过校验。</p>
+        <h4>未通过校验时</h4>
+        <pre><code>HTTP/1.1 401 Unauthorized
+Content-Type: application/json; charset=utf-8
+
+{"ok":false,"error":"未登录","needLogin":true}</code></pre>
+        <h4>方式一：口令</h4>
+        <p>先 POST 到 <code>?a=login</code>，成功后服务端下发 session cookie，后续请求带上同一个 cookie 即可。连续失败 5 次会锁定 10 分钟。</p>
+        <h4>方式二：URL 密钥</h4>
+        <p>用 <code>{{ORIGIN}}?k=你的密钥</code> 访问一次，服务端下发一个基于 HMAC 的 cookie（90 天有效），之后直接访问即可。密钥不落 cookie，无法伪造。</p>
+      </section>
+
+      <section class="sec" id="extract">
+        <h2>解析链接</h2>
+        <div class="eph"><span class="tag post">POST</span><span class="path">?a=extract</span></div>
+        <p>从文本里提取全部 <code>http(s)</code> 链接并去重，不下载。前端靠它拿到总数，再决定怎么分批。</p>
+        <h4>请求体（form-data / x-www-form-urlencoded）</h4>
+        <table class="tbl">
+          <tr><th>字段</th><th>类型</th><th>说明</th></tr>
+          <tr><td>text</td><td>string</td><td>可含链接的任意文本：一行一个、整段聊天记录、网页源码、Markdown 都行</td></tr>
+        </table>
+        <h4>响应</h4>
+        <pre><code>{
+  "ok": true,
+  "urls": [
+    "https://chat-img.jwznb.com/abc.jpg",
+    "https://chat-img3.jwznb.com/def.webp"
+  ],
+  "total": 2,
+  "truncated": 0,
+  "batchSize": 20
+}</code></pre>
+        <table class="tbl">
+          <tr><th>字段</th><th>说明</th></tr>
+          <tr><td>truncated</td><td>超过 <code>max_urls</code>（默认 1000）而未返回的链接数</td></tr>
+          <tr><td>batchSize</td><td>建议每批处理数量，取自配置 <code>batch_size</code></td></tr>
+        </table>
+        <div class="note">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 16v-4M12 8h.01"/></svg>
+          <div>这里只做提取，不过滤域名。非云湖域名的链接会在下一步 <code>batch</code> 时标成跳过。</div>
+        </div>
+      </section>
+
+      <section class="sec" id="batch">
+        <h2>下载一批</h2>
+        <div class="eph"><span class="tag post">POST</span><span class="path">?a=batch</span></div>
+        <p>下载这一批地址。每批数量由调用方定，建议用 <code>extract</code> 返回的 <code>batchSize</code>，单次请求就不会超时。</p>
+        <h4>请求体</h4>
+        <table class="tbl">
+          <tr><th>字段</th><th>类型</th><th>说明</th></tr>
+          <tr><td>urls</td><td>string</td><td>JSON 数组字符串，或换行分隔的地址。每批最多 <code>batch_size × 2</code> 个，超出部分丢弃并计入 <code>truncated</code></td></tr>
+          <tr><td>text</td><td>string</td><td>兼容旧版的写法：直接贴文本，服务端自己提取。分页能力不如 <code>urls</code>，不推荐</td></tr>
+        </table>
+        <h4>响应</h4>
+        <pre><code>{
+  "ok": true,
+  "items": [
+    {
+      "ok": true,
+      "url": "https://chat-img.jwznb.com/abc.jpg",
+      "key": "f7a75e4837cf1039",
+      "file": "f7a75e4837cf1039.jpg",
+      "name": "abc.jpg",
+      "mime": "image/jpeg",
+      "ext": "jpg",
+      "w": 1080,
+      "h": 1440,
+      "bytes": 184320,
+      "size": "180.0 KB",
+      "ts": 1794631970,
+      "cached": true
+    }
+  ],
+  "summary": {
+    "total": 1, "success": 1, "fail": 0, "skipped": 0,
+    "bytes": 184320, "size": "180.0 KB", "ms": 412, "truncated": 0
+  }
+}</code></pre>
+        <h4>失败项</h4>
+        <pre><code>{
+  "ok": false,
+  "url": "https://chat-img.jwznb.com/missing.jpg",
+  "err": "图片不存在（404）",
+  "retryable": false
+}</code></pre>
+        <p><code>retryable</code> 为 <code>true</code> 是临时性问题（超时、连不上、429、5xx、空响应），可以再试；<code>false</code> 是确定性失败（403、404、不是图片、超限），重试没用。服务端已按 <code>retry</code> 自动重试过一遍。</p>
+        <h4>curl 示例</h4>
+        <pre><code>curl -X POST '{{ORIGIN}}?a=batch' \
+  --data-urlencode 'urls=["https://chat-img.jwznb.com/abc.jpg"]'</code></pre>
+      </section>
+
+      <section class="sec" id="raw">
+        <h2>预览原图</h2>
+        <div class="eph"><span class="tag get">GET</span><span class="path">?a=raw&amp;k=KEY</span></div>
+        <p>返回缓存里的图片原始字节，用于页面缩略图预览。带 <code>Content-Security-Policy: sandbox</code>，即使内容是 SVG 也不会执行脚本。</p>
+        <table class="tbl">
+          <tr><th>参数</th><th>说明</th></tr>
+          <tr><td>k</td><td>图片的缓存键，<code>batch</code> 返回的 <code>key</code> 字段</td></tr>
+        </table>
+        <p>缓存文件不存在时返回 <b>404</b> 和一行提示文本。</p>
+      </section>
+
+      <section class="sec" id="dl">
+        <h2>下载单张</h2>
+        <div class="eph"><span class="tag get">GET</span><span class="path">?a=dl&amp;k=KEY</span></div>
+        <p>以附件形式返回单张图片，<code>Content-Disposition</code> 里的文件名取自原始链接。</p>
+        <table class="tbl">
+          <tr><th>参数</th><th>说明</th></tr>
+          <tr><td>k</td><td>缓存键</td></tr>
+        </table>
+      </section>
+
+      <section class="sec" id="zip">
+        <h2>打包 ZIP</h2>
+        <div class="eph"><span class="tag get">GET</span><span class="path">?a=zip&amp;k=KEY1,KEY2,...</span></div>
+        <p>把多张图片打成 ZIP 返回。ZIP 由程序自己写字节流，<b>不依赖 PHP 的 zip 扩展</b>。包内文件名带两位序号前缀去重，如 <code>01_abc.jpg</code>。</p>
+        <table class="tbl">
+          <tr><th>参数</th><th>说明</th></tr>
+          <tr><td>k</td><td>多个缓存键，英文逗号分隔</td></tr>
+        </table>
+        <pre><code>curl -o images.zip '{{ORIGIN}}?a=zip&amp;k=f7a75e4837cf1039,dba53a2fa8181f5f'</code></pre>
+        <p>没有任何可用文件时返回 <b>404</b>；<code>k</code> 为空时返回 <b>400</b>。</p>
+      </section>
+
+      <section class="sec" id="local">
+        <h2>读取 urls.txt</h2>
+        <div class="eph"><span class="tag get">GET</span><span class="path">?a=local</span></div>
+        <p>读取程序同目录下的 <code>urls.txt</code> 并返回其中的链接。可以把一批常下的地址存在服务器上。</p>
+        <pre><code>{"ok":true,"urls":["https://..."],"count":12}</code></pre>
+        <p>文件不存在或没提取到链接时返回 <code>{"ok":false,"error":"..."}</code>。</p>
+      </section>
+
+      <section class="sec" id="login">
+        <h2>口令登录</h2>
+        <div class="eph"><span class="tag post">POST</span><span class="path">?a=login</span></div>
+        <p>仅在配置了 <code>password</code> 时需要。</p>
+        <h4>请求体</h4>
+        <table class="tbl">
+          <tr><th>字段</th><th>说明</th></tr>
+          <tr><td>password</td><td>访问口令</td></tr>
+        </table>
+        <pre><code>{"ok":true}
+{"ok":false,"error":"口令不正确"}</code></pre>
+      </section>
+
+      <section class="sec" id="logout">
+        <h2>退出</h2>
+        <div class="eph"><span class="tag get">GET</span><span class="path">?a=logout</span></div>
+        <p>清空 session 并 302 跳回首页。同时会清掉 URL 密钥下发的 cookie。</p>
+      </section>
+
+      <section class="sec" id="errors">
+        <h2>错误与限制</h2>
+        <h4>HTTP 状态</h4>
+        <table class="tbl">
+          <tr><th>状态</th><th>场景</th></tr>
+          <tr><td>400</td><td>缺少必要参数（如 zip 未给 k）</td></tr>
+          <tr><td>401</td><td>未通过访问校验，返回 needLogin</td></tr>
+          <tr><td>404</td><td>缓存文件已过期或被清理</td></tr>
+        </table>
+        <h4>硬性限制</h4>
+        <table class="tbl">
+          <tr><th>限制</th><th>默认值</th><th>配置项</th></tr>
+          <tr><td>只抓云湖域名</td><td>*.jwznb.com、*.jwzhd.com</td><td>allow_host</td></tr>
+          <tr><td>单张图片大小</td><td>20 MB</td><td>max_bytes</td></tr>
+          <tr><td>单次提交链接数</td><td>1000</td><td>max_urls</td></tr>
+          <tr><td>每批下载数</td><td>20（硬上限 40）</td><td>batch_size</td></tr>
+          <tr><td>单张失败自动重试</td><td>1 次</td><td>retry</td></tr>
+          <tr><td>缓存保留</td><td>7 天</td><td>cache_days</td></tr>
+        </table>
+        <div class="note">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 9v4M12 17h.01"/><path d="M10.3 3.9L1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg>
+          <div>域名白名单是刻意留的。放开任意域名的话，这页面就成了别人探测内网的开放代理。</div>
+        </div>
+      </section>
+
+      <div class="foot">云湖图片下载器 {{VER}}</div>
+    </main>
+  </div>
+</div>
+<script>
+  const th = new URLSearchParams(location.search).get('theme');
+  if (th === 'dark' || th === 'light') document.documentElement.dataset.theme = th;
+</script>
+</body>
+</html>
+HTML;
+
+    echo str_replace(['{{VER}}', '{{ORIGIN}}'], [$ver, $origin], $html);
+}
+
 /* ==================== 命令行模式 ==================== */
 if (PHP_SAPI === 'cli') {
     $argvList = array_slice($argv, 1);
@@ -767,6 +1137,14 @@ if ($action !== '') {
         http_response_code(401);
         header('Content-Type: application/json; charset=utf-8');
         echo json_encode(['ok' => false, 'error' => '未登录', 'needLogin' => true], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+
+    // ---- API 文档页（通过校验后展示）----
+    if ($action === 'docs') {
+        header('Content-Type: text/html; charset=utf-8');
+        header("Content-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'");
+        imgdl_render_docs();
         exit;
     }
 
@@ -1133,6 +1511,8 @@ if (is_file($lf)) {
     --line:#e6eaf2; --sh:0 1px 2px rgba(24,33,50,.04), 0 8px 24px rgba(24,33,50,.06);
   }
   *{box-sizing:border-box}
+  /* hidden 必须压过 .btn 等的 display，否则空状态会漏出按钮 */
+  [hidden]{display:none !important}
   html,body{margin:0}
   body{
     background:var(--bg); color:var(--tx);
@@ -1146,14 +1526,15 @@ if (is_file($lf)) {
   h1 .bg svg{width:16px;height:16px;stroke:#fff;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
   .sub{color:var(--tx2);font-size:13px;margin:2px 0 22px;padding-left:40px}
 
-  /* 顶栏：标题 + 退出 */
+  /* 顶栏：标题 + 右侧操作 */
   .topbar{display:flex;align-items:center;gap:12px}
   .topbar h1{margin-bottom:0}
-  .logout{
-    margin-left:auto;flex:none;font-size:12.5px;color:var(--tx2);text-decoration:none;
+  .topacts{margin-left:auto;display:flex;align-items:center;gap:8px;flex:none}
+  .tlink{
+    font-size:12.5px;color:var(--tx2);text-decoration:none;
     padding:6px 13px;border:1px solid var(--line);border-radius:8px;transition:.15s;background:var(--card);
   }
-  .logout:hover{color:var(--tx);border-color:#c3cee3}
+  .tlink:hover{color:var(--tx);border-color:#c3cee3}
 
   /* 部署告警 */
   .warns{margin:0 0 16px;display:flex;flex-direction:column;gap:8px}
@@ -1192,6 +1573,13 @@ if (is_file($lf)) {
   .btn.ghost{background:transparent}
   .hint{color:var(--tx3);font-size:12.5px;margin-left:auto}
   @media(max-width:640px){.hint{margin-left:0;width:100%}}
+  @media(max-width:560px){
+    body{padding:20px 14px 100px}
+    .topbar{flex-wrap:wrap;gap:10px}
+    h1{font-size:19px}
+    .topacts{width:100%;margin-left:0;justify-content:flex-end}
+    .sub{padding-left:0;margin-bottom:18px}
+  }
 
   .note{
     margin-top:14px;padding:11px 14px;border-radius:10px;font-size:12.5px;color:var(--tx2);
@@ -1200,7 +1588,7 @@ if (is_file($lf)) {
   .note b{color:var(--tx);font-weight:600}
   .note .i{color:var(--acc);flex:none;margin-top:1px}
 
-  .stats{display:flex;gap:18px;flex-wrap:wrap;margin:20px 2px 12px;font-size:12.5px;color:var(--tx2)}
+  .stats{display:flex;gap:18px;flex-wrap:wrap;margin:20px 0 12px;font-size:12.5px;color:var(--tx2)}
   .stats b{color:var(--tx);font-weight:600;font-variant-numeric:tabular-nums}
   .stats .ok b{color:var(--ok)} .stats .bad b{color:var(--err)}
 
@@ -1281,9 +1669,12 @@ if (is_file($lf)) {
       <span class="bg"><svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/></svg></span>
       云湖防盗链图片下载器
     </h1>
+    <div class="topacts">
+      <a class="tlink" href="?a=docs">API 文档</a>
 <?php if ((string)($CFG['password'] ?? '') !== ''): ?>
-    <a class="logout" href="?a=logout">退出</a>
+      <a class="tlink" href="?a=logout">退出</a>
 <?php endif; ?>
+    </div>
   </div>
   <p class="sub">粘贴图片链接，服务端带合法 Referer 取回，绕过 403 直接存图</p>
 
@@ -1317,7 +1708,7 @@ if (is_file($lf)) {
     </div>
     <div class="note">
       <svg class="i" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 16v-4M12 8h.01"/></svg>
-      <div>云湖图片服务器只认 <b>*.jwzhd.com</b> 的 Referer，浏览器直接打开或右键保存都会 403。本工具在服务端补上该请求头再转发，所以能正常拿到图。</div>
+      <div>云湖图片服务器只认 <b>*.jwzhd.com</b> 的 Referer，浏览器直接打开或右键保存都是 403。这里由服务端补上请求头再转发。</div>
     </div>
   </div>
 
@@ -1369,7 +1760,9 @@ function progUpdate(done, total) {
   $('#progTxt').textContent = `已处理 ${done} / ${total}（${pct}%）`;
 }
 function progHide() {
-  $('#prog').hidden = true;
+  // 稍等一下再收起，让 100% 的状态能被看见
+  clearTimeout(progHide._t);
+  progHide._t = setTimeout(() => { $('#prog').hidden = true; }, 420);
 }
 
 /* 按 URL 合并结果：重试成功时替换掉原来那条失败记录 */
