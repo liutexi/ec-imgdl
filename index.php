@@ -48,6 +48,9 @@ if (!function_exists('str_contains')) {
 @ini_set('memory_limit', '256M');
 @ini_set('display_errors', '0');   // 线上不要把 PHP 报错混进 JSON 响应，错误仍进日志
 
+/* ==================== 版本 ==================== */
+define('IMGDL_VERSION', 'V0.0.2');
+
 /* ==================== 配置 ==================== */
 // 默认值；线上要改的放在同目录 config.php 里，避免升级主程序时被覆盖
 $CFG = [
@@ -60,7 +63,9 @@ $CFG = [
     'password'   => '',                 // 访问口令；空 = 不校验
     'access_key' => '',                 // URL 密钥；空 = 不校验（见 config.php 说明）
     'max_bytes'  => 20 * 1024 * 1024,   // 单张上限 20MB
-    'max_urls'   => 200,                // 单次最多处理多少个链接
+    'max_urls'   => 1000,               // 单次提交的链接总数上限
+    'batch_size' => 20,                 // 每批下载多少个（前端按此分批，避免单请求超时）
+    'retry'      => 1,                  // 单张失败后的自动重试次数
     'cache_days' => 7,                  // 缓存保留天数
     'timeout'    => 25,
     'conc'       => 6,                  // 并发数
@@ -296,7 +301,9 @@ function imgdl_save(string $url, string $body, array $httpInfo): array
 {
     global $CFG;
 
-    $bad = static fn(string $msg): array => ['ok' => false, 'url' => $url, 'err' => $msg];
+    // retryable=true 表示网络抖动等临时性问题，值得重试；403/404/非图片属于确定性失败，不重试
+    $bad = static fn(string $msg, bool $retryable = false): array
+        => ['ok' => false, 'url' => $url, 'err' => $msg, 'retryable' => $retryable];
 
     if (($httpInfo['err'] ?? 0) !== 0) {
         $map = [
@@ -306,15 +313,17 @@ function imgdl_save(string $url, string $body, array $httpInfo): array
             CURLE_SSL_CONNECT_ERROR => 'SSL 握手失败',
             CURLE_FILESIZE_EXCEEDED => '文件超过大小上限',
         ];
-        return $bad($map[$httpInfo['err']] ?? ('网络错误 #' . $httpInfo['err']));
+        return $bad($map[$httpInfo['err']] ?? ('网络错误 #' . $httpInfo['err']), true);
     }
 
     $code = (int)($httpInfo['code'] ?? 0);
     if ($code === 403) return $bad('被防盗链拦截（403）');
     if ($code === 404) return $bad('图片不存在（404）');
+    if ($code === 429) return $bad('请求过于频繁（429）', true);
+    if ($code >= 500) return $bad('服务器返回 HTTP ' . $code, true);
     if ($code !== 200) return $bad('服务器返回 HTTP ' . $code);
 
-    if (!is_string($body) || $body === '') return $bad('响应为空');
+    if (!is_string($body) || $body === '') return $bad('响应为空', true);
 
     $len = strlen($body);
     if ($len > (int)$CFG['max_bytes']) return $bad('超过大小上限（' . imgdl_size_cn($len) . '）');
@@ -401,76 +410,114 @@ function imgdl_gc(?int $days = null, int $prob = 20): void
 }
 
 /**
+ * 纯 curl_multi 执行层：把一批 URL 拉下来并落盘。
+ * 不做域名校验、不查缓存、不重试——这些由 imgdl_fetch_many 统一负责。
+ * 返回 url => result 的映射。
+ */
+function imgdl_multi_run(array $urls, int $conc): array
+{
+    $urls = array_values($urls);
+    if (!$urls) return [];
+
+    $conc    = max(1, $conc);
+    $results = [];
+    $mh      = curl_multi_init();
+    $map     = [];   // (int)$ch => url
+    $total   = count($urls);
+    $started = 0;
+    $running = 0;
+
+    while ($started < $total || $running > 0) {
+        while ($running < $conc && $started < $total) {
+            $u  = $urls[$started++];
+            $ch = imgdl_new_handle($u);
+            $map[(int)$ch] = $u;
+            curl_multi_add_handle($mh, $ch);
+            $running++;
+        }
+
+        do { $mrc = curl_multi_exec($mh, $active); }
+        while ($mrc === CURLM_CALL_MULTI_PERFORM);
+
+        while ($done = curl_multi_info_read($mh)) {
+            $ch   = $done['handle'];
+            $id   = (int)$ch;
+            $u    = $map[$id] ?? '';
+            $body = curl_multi_getcontent($ch);
+            $info = [
+                'code' => (int)curl_getinfo($ch, CURLINFO_HTTP_CODE),
+                'type' => (string)curl_getinfo($ch, CURLINFO_CONTENT_TYPE),
+                'err'  => (int)$done['result'],
+            ];
+            curl_multi_remove_handle($mh, $ch);
+            curl_close($ch);
+            unset($map[$id]);
+            $running--;
+
+            if ($u !== '') {
+                $results[$u] = imgdl_save($u, is_string($body) ? $body : '', $info);
+            }
+        }
+
+        if ($running > 0) curl_multi_select($mh, 0.4);
+    }
+
+    curl_multi_close($mh);
+    return $results;
+}
+
+/**
  * 批量下载（curl_multi 并发）。
  * 返回按输入顺序排列的结果数组，跳过项带 skip=true。
+ *
+ * V0.0.2：对「可重试」的失败项（超时、连接失败、429、5xx、空响应）自动重跑，
+ *         次数由 config 的 retry 决定，避免一次网络抖动就把整张图判死。
  */
 function imgdl_fetch_many(array $urls, ?int $conc = null): array
 {
     global $CFG;
     imgdl_gc();
-    $conc = max(1, $conc ?? (int)$CFG['conc']);
+    $conc     = max(1, $conc ?? (int)$CFG['conc']);
+    $maxRetry = max(0, (int)($CFG['retry'] ?? 1));
 
     $results = [];   // url => result（保持插入顺序）
-    $jobs    = [];
+    $pending = [];
+    $seen    = [];
 
     foreach ($urls as $raw) {
         $u = trim((string)$raw);
-        if ($u === '' || isset($results[$u]) || in_array($u, $jobs, true)) continue;
+        if ($u === '' || isset($seen[$u])) continue;
+        $seen[$u] = true;
 
         [$ok, $err, $skip] = imgdl_check_url($u);
         if (!$ok) {
-            $results[$u] = ['ok' => false, 'url' => $u, 'err' => $err, 'skip' => $skip];
+            $results[$u] = ['ok' => false, 'url' => $u, 'err' => $err, 'skip' => $skip, 'retryable' => false];
             continue;
         }
         $hit = imgdl_meta_cached($u);
         if ($hit !== null) { $results[$u] = $hit; continue; }
 
-        $jobs[] = $u;
+        $pending[] = $u;
     }
 
-    if ($jobs) {
-        $mh      = curl_multi_init();
-        $map     = [];   // (int)$ch => url
-        $queue   = $jobs;
-        $total   = count($queue);
-        $started = 0;
-        $running = 0;
-
-        while ($started < $total || $running > 0) {
-            while ($running < $conc && $started < $total) {
-                $u  = $queue[$started++];
-                $ch = imgdl_new_handle($u);
-                $map[(int)$ch] = $u;
-                curl_multi_add_handle($mh, $ch);
-                $running++;
-            }
-
-            do { $mrc = curl_multi_exec($mh, $active); }
-            while ($mrc === CURLM_CALL_MULTI_PERFORM);
-
-            while ($done = curl_multi_info_read($mh)) {
-                $ch  = $done['handle'];
-                $id  = (int)$ch;
-                $u   = $map[$id] ?? '';
-                $body = curl_multi_getcontent($ch);
-                $info = [
-                    'code' => (int)curl_getinfo($ch, CURLINFO_HTTP_CODE),
-                    'type' => (string)curl_getinfo($ch, CURLINFO_CONTENT_TYPE),
-                    'err'  => (int)$done['result'],
-                ];
-                curl_multi_remove_handle($mh, $ch);
-                curl_close($ch);
-                unset($map[$id]);
-                $running--;
-
-                if ($u !== '') {
-                    $results[$u] = imgdl_save($u, is_string($body) ? $body : '', $info);
-                }
-            }
-
-            if ($running > 0) curl_multi_select($mh, 0.4);
+    // 首轮 + 对可重试失败项重试（每轮之间做一次短退避）
+    $attempt = 0;
+    while ($pending) {
+        foreach (imgdl_multi_run($pending, $conc) as $u => $r) {
+            $results[$u] = $r;
         }
-        curl_multi_close($mh);
+        if ($attempt >= $maxRetry) break;
+        $attempt++;
+
+        $retry = [];
+        foreach ($pending as $u) {
+            $r = $results[$u] ?? null;
+            if ($r !== null && empty($r['ok']) && !empty($r['retryable'])) $retry[] = $u;
+        }
+        if (!$retry) break;
+
+        usleep(250000 * $attempt);   // 退避：250ms、500ms…
+        $pending = $retry;
     }
 
     // 按输入顺序还原
@@ -723,23 +770,61 @@ if ($action !== '') {
         exit;
     }
 
-    // ---- 批量解析并下载 ----
-    if ($action === 'batch') {
+    // ---- 只解析链接、不下载（前端据此分批调度，避免单请求超时）----
+    if ($action === 'extract') {
         header('Content-Type: application/json; charset=utf-8');
-        $raw  = (string)($_POST['text'] ?? '');
-        $urls = imgdl_extract_urls($raw);
+        $urls    = imgdl_extract_urls((string)($_POST['text'] ?? ''));
+        $maxUrls = max(1, (int)($CFG['max_urls'] ?? 1000));
 
-        if (!$urls) {
-            echo json_encode(['ok' => false, 'error' => '没有识别到任何链接'], JSON_UNESCAPED_UNICODE);
-            exit;
-        }
-
-        // 单次数量上限，避免一个请求跑太久被主机掐断
-        $maxUrls = max(1, (int)($CFG['max_urls'] ?? 200));
         $truncated = 0;
         if (count($urls) > $maxUrls) {
             $truncated = count($urls) - $maxUrls;
             $urls = array_slice($urls, 0, $maxUrls);
+        }
+
+        echo json_encode([
+            'ok'        => true,
+            'urls'      => array_values($urls),
+            'total'     => count($urls),
+            'truncated' => $truncated,
+            'batchSize' => max(1, (int)($CFG['batch_size'] ?? 20)),
+        ], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+
+    // ---- 下载一批（前端按批调用）----
+    if ($action === 'batch') {
+        header('Content-Type: application/json; charset=utf-8');
+
+        // 新前端传 urls（JSON 数组或换行分隔）；旧前端 / 书签传 text，走兼容分支
+        if (isset($_POST['urls'])) {
+            $in = $_POST['urls'];
+            if (is_array($in)) {
+                $urls = array_map('strval', $in);
+            } else {
+                $tmp  = json_decode((string)$in, true);
+                $urls = is_array($tmp) ? array_map('strval', $tmp) : preg_split('/\R/', (string)$in);
+            }
+        } elseif (isset($_POST['text'])) {
+            $urls = imgdl_extract_urls((string)$_POST['text']);
+        } else {
+            $urls = [];
+        }
+
+        $urls = array_values(array_filter(array_map('trim', $urls), static fn($u) => $u !== ''));
+
+        // 每批硬上限：防止有人绕过分批、一次塞几千个把主机拖死
+        $batchSize = max(1, (int)($CFG['batch_size'] ?? 20));
+        $hardCap   = $batchSize * 2;
+        $truncated = 0;
+        if (count($urls) > $hardCap) {
+            $truncated = count($urls) - $hardCap;
+            $urls = array_slice($urls, 0, $hardCap);
+        }
+
+        if (!$urls) {
+            echo json_encode(['ok' => false, 'error' => '没有识别到任何链接'], JSON_UNESCAPED_UNICODE);
+            exit;
         }
 
         $t0  = microtime(true);
@@ -1059,7 +1144,7 @@ if (is_file($lf)) {
   h1 .bg{width:30px;height:30px;border-radius:9px;background:linear-gradient(135deg,#5b86ff,#3b66e8);
     display:grid;place-items:center;flex:none;box-shadow:0 4px 12px rgba(79,124,255,.35)}
   h1 .bg svg{width:16px;height:16px;stroke:#fff;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
-  .sub{color:var(--tx2);font-size:13px;margin:0 0 20px;padding-left:40px}
+  .sub{color:var(--tx2);font-size:13px;margin:2px 0 22px;padding-left:40px}
 
   /* 顶栏：标题 + 退出 */
   .topbar{display:flex;align-items:center;gap:12px}
@@ -1082,7 +1167,7 @@ if (is_file($lf)) {
   }
 
   /* 页脚 */
-  .foot{text-align:center;font-size:11.5px;color:var(--tx3);margin:30px 0 4px;letter-spacing:.2px}
+  .foot{text-align:center;font-size:11.5px;color:var(--tx3);margin:22px 0 4px;letter-spacing:.2px}
 
   .card{background:var(--card);border:1px solid var(--line);border-radius:14px;box-shadow:var(--sh)}
   .panel{padding:16px}
@@ -1119,6 +1204,12 @@ if (is_file($lf)) {
   .stats b{color:var(--tx);font-weight:600;font-variant-numeric:tabular-nums}
   .stats .ok b{color:var(--ok)} .stats .bad b{color:var(--err)}
 
+  /* 分批下载进度条 */
+  .prog{margin-top:12px}
+  .prog-bar{height:5px;border-radius:3px;background:var(--line);overflow:hidden}
+  .prog-bar i{display:block;height:100%;width:0;background:var(--acc);border-radius:3px;transition:width .25s ease}
+  .prog-txt{margin-top:7px;font-size:12px;color:var(--tx2);font-variant-numeric:tabular-nums}
+
   .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(158px,1fr));gap:14px;margin-top:6px}
   .it{
     background:var(--card);border:1px solid var(--line);border-radius:12px;overflow:hidden;
@@ -1150,7 +1241,7 @@ if (is_file($lf)) {
   .it.sel{border-color:var(--acc);box-shadow:0 0 0 2px rgba(79,124,255,.22),var(--sh)}
 
   .it.bad{display:flex;flex-direction:column;justify-content:center;padding:16px 13px;min-height:150px;
-    border-style:dashed;background:transparent;box-shadow:none}
+    border-style:dashed;background:transparent;box-shadow:none;aspect-ratio:1/1}
   .it.bad .t{font-size:12.5px;font-weight:600;color:var(--err);margin-bottom:4px;display:flex;align-items:center;gap:5px}
   .it.bad .u{font-size:11px;color:var(--tx3);word-break:break-all;line-height:1.5;
     display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
@@ -1166,7 +1257,7 @@ if (is_file($lf)) {
   .bar .cnt{font-size:12.5px;color:var(--tx2);margin-right:auto}
   .bar .cnt b{color:var(--tx);font-variant-numeric:tabular-nums}
 
-  .empty{text-align:center;padding:60px 20px;color:var(--tx3)}
+  .empty{text-align:center;padding:44px 20px 8px;color:var(--tx3)}
   .empty svg{width:44px;height:44px;stroke:currentColor;fill:none;stroke-width:1.5;opacity:.5;margin-bottom:12px}
   .empty p{margin:0;font-size:13px}
 
@@ -1217,7 +1308,12 @@ if (is_file($lf)) {
       <button class="btn ghost" id="local">载入 urls.txt（<?= (int)$localCount ?>）</button>
 <?php endif; ?>
       <button class="btn ghost" id="clr">清空</button>
-      <span class="hint">支持多行 · 自动去重 · 并发 6 路</span>
+      <button class="btn ghost" id="retryFail" hidden>重试失败项</button>
+      <span class="hint">支持多行 · 自动去重 · 分批下载</span>
+    </div>
+    <div class="prog" id="prog" hidden>
+      <div class="prog-bar"><i id="progFill"></i></div>
+      <div class="prog-txt" id="progTxt"></div>
     </div>
     <div class="note">
       <svg class="i" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 16v-4M12 8h.01"/></svg>
@@ -1232,7 +1328,9 @@ if (is_file($lf)) {
     <p>还没有图片，先在上方粘贴链接</p>
   </div>
 <?php if ($unguarded): ?>
-  <div class="foot">未设访问限制 · 知道地址即可使用</div>
+  <div class="foot">未设访问限制 · 知道地址即可使用 · <?= IMGDL_VERSION ?></div>
+<?php else: ?>
+  <div class="foot"><?= IMGDL_VERSION ?></div>
 <?php endif; ?>
 </div>
 
@@ -1248,7 +1346,50 @@ if (is_file($lf)) {
 
 <script>
 const $ = (s) => document.querySelector(s);
-const S = { items: [], sel: new Set(), busy: false };
+const S = { items: [], sel: new Set(), busy: false, skipped: 0, truncated: 0 };
+
+/* 统一 POST 封装：口令过期时自动回到口令页 */
+async function postForm(url, data) {
+  const fd = new FormData();
+  for (const k in data) fd.append(k, data[k]);
+  const r = await fetch(url, { method: 'POST', body: fd });
+  if (r.status === 401) { location.reload(); throw new Error('登录已过期'); }
+  return r.json();
+}
+
+/* 进度条 */
+function progShow(total) {
+  $('#prog').hidden = false;
+  $('#progFill').style.width = '0%';
+  $('#progTxt').textContent = `0 / ${total}`;
+}
+function progUpdate(done, total) {
+  const pct = total ? Math.round((done / total) * 100) : 0;
+  $('#progFill').style.width = pct + '%';
+  $('#progTxt').textContent = `已处理 ${done} / ${total}（${pct}%）`;
+}
+function progHide() {
+  $('#prog').hidden = true;
+}
+
+/* 按 URL 合并结果：重试成功时替换掉原来那条失败记录 */
+function mergeItems(list) {
+  const idx = new Map(S.items.map((x, i) => [x.url, i]));
+  for (const it of list) {
+    const i = idx.get(it.url);
+    if (i !== undefined) S.items[i] = it;
+    else { idx.set(it.url, S.items.length); S.items.push(it); }
+  }
+}
+
+function setBusy(b) {
+  const btn = $('#go');
+  btn.classList.toggle('loading', b);
+  btn.disabled = b;
+  btn.querySelector('span:last-child').textContent = b ? '下载中…' : '解析并下载';
+  const rf = $('#retryFail');
+  if (rf) rf.disabled = b;
+}
 
 function toast(msg, ms = 2200) {
   const t = $('#toast');
@@ -1305,14 +1446,20 @@ function render() {
     </div>`;
   }).join('');
 
+  const totalBytes = good.reduce((a, x) => a + (Number(x.bytes) || 0), 0);
+
   $('#stats').hidden = false;
   $('#stats').innerHTML = `
     <span>共 <b>${S.items.length}</b> 项</span>
     <span class="ok">成功 <b>${good.length}</b></span>
     <span class="bad">失败 <b>${bad.length}</b></span>
-    ${S.lastSum ? `<span>合计 <b>${esc(S.lastSum.size)}</b></span><span>耗时 <b>${S.lastSum.ms} ms</b></span>` : ''}
-    ${S.lastSum && S.lastSum.skipped ? `<span>已忽略非云湖链接 <b>${S.lastSum.skipped}</b></span>` : ''}
+    <span>合计 <b>${fmtSize(totalBytes)}</b></span>
+    ${S.skipped ? `<span>已忽略非云湖链接 <b>${S.skipped}</b></span>` : ''}
+    ${S.truncated ? `<span>超出上限未处理 <b>${S.truncated}</b></span>` : ''}
   `;
+
+  const rf = $('#retryFail');
+  if (rf) rf.hidden = bad.length === 0 || S.busy;
 
   $('#bar').classList.toggle('on', good.length > 0);
   $('#cnt').innerHTML = `已选 <b>${S.sel.size}</b> / ${good.length} 张`;
@@ -1340,46 +1487,94 @@ $('#grid').addEventListener('click', (e) => {
   syncSel();
 });
 
-async function run() {
+/**
+ * 分批下载主流程。
+ *   run()          从输入框解析全部链接，再逐批下载（每批回来就刷新，进度可见）
+ *   run([url...])  只重试指定地址，不清空已有结果
+ */
+async function run(urlsOverride) {
   if (S.busy) return;
+  const isRetry = Array.isArray(urlsOverride);
   const text = $('#in').value.trim();
-  if (!text) { toast('先粘贴图片链接'); $('#in').focus(); return; }
+  if (!isRetry && !text) { toast('先粘贴图片链接'); $('#in').focus(); return; }
 
   S.busy = true;
-  const btn = $('#go');
-  btn.classList.add('loading');
-  btn.disabled = true;
-  btn.querySelector('span:last-child').textContent = '下载中…';
+  setBusy(true);
+  render();
 
   try {
-    const fd = new FormData();
-    fd.append('text', text);
-    const r = await fetch('?a=batch', { method: 'POST', body: fd });
+    let urls;
+    let batchSize = 20;
 
-    // 口令过期 / 会话失效 → 回到口令页
-    if (r.status === 401) { location.reload(); return; }
+    if (isRetry) {
+      urls = urlsOverride;
+    } else {
+      const ex = await postForm('?a=extract', { text });
+      if (!ex.ok) { toast(ex.error || '解析失败'); return; }
 
-    const j = await r.json();
+      urls = ex.urls || [];
+      batchSize = ex.batchSize || 20;
+      S.skipped = 0;
+      S.truncated = ex.truncated || 0;   // 超出总上限、本次未处理的链接数
 
-    if (!j.ok) { toast(j.error || '解析失败'); return; }
+      if (!urls.length) { toast('没有识别到云湖图片链接'); return; }
 
-    S.items = j.items || [];
-    S.lastSum = j.summary;
-    S.sel = new Set(S.items.filter((x) => x.ok).map((x) => x.key));
-    render();
-    syncSel();
+      S.items = [];              // 新一轮：清掉上一次的结果
+      S.sel.clear();
+      render();
+    }
 
-    const s = j.summary;
-    toast(s.total === 0
-      ? `只识别到 ${s.skipped} 个非云湖链接，已忽略`
-      : `成功 ${s.success} 张，失败 ${s.fail} 张` + (s.truncated ? `（超出单次上限，还有 ${s.truncated} 个未处理）` : ''), 3200);
+    if (!urls.length) { toast('没有需要重试的链接'); return; }
+
+    const total = urls.length;
+    let done = 0;
+    progShow(total);
+
+    for (let i = 0; i < total; i += batchSize) {
+      const slice = urls.slice(i, i + batchSize);
+      let j = null;
+
+      try {
+        j = await postForm('?a=batch', { urls: JSON.stringify(slice) });
+      } catch (e) {
+        j = null;                  // 单批网络失败不中断整体，标记后可重试
+      }
+
+      if (j && j.ok) {
+        const added = j.items || [];
+        mergeItems(added);
+        // 只把这一批新下成功的加入选中，保留用户已有的选择
+        for (const it of added) if (it.ok && it.key) S.sel.add(it.key);
+        S.skipped += (j.summary && j.summary.skipped) || 0;   // 非云湖域名，后端已忽略
+      } else {
+        const why = (j && j.error) || '请求失败，可重试';
+        for (const u of slice) {
+          mergeItems([{ ok: false, url: u, err: why, retryable: true }]);
+        }
+      }
+
+      done += slice.length;
+      progUpdate(done, total);
+
+      render();
+      syncSel();
+    }
+
+    progHide();
+
+    const ok = S.items.filter((x) => x.ok).length;
+    const bad = S.items.filter((x) => !x.ok).length;
+    toast(`完成：成功 ${ok} 张，失败 ${bad} 张`
+      + (S.skipped ? `，已忽略 ${S.skipped} 个非云湖链接` : '')
+      + (S.truncated ? `，另有 ${S.truncated} 个超出上限未处理` : '')
+      + (bad ? '，可点「重试失败项」' : ''), 3600);
   } catch (err) {
+    progHide();
     toast('请求失败：' + err.message);
   } finally {
     S.busy = false;
-    btn.classList.remove('loading');
-    btn.disabled = false;
-    btn.querySelector('span:last-child').textContent = '解析并下载';
+    setBusy(false);
+    render();
   }
 }
 
@@ -1390,8 +1585,18 @@ $('#in').addEventListener('keydown', (e) => {
 
 $('#clr').addEventListener('click', () => {
   $('#in').value = '';
-  S.items = []; S.sel.clear(); S.lastSum = null;
+  S.items = []; S.sel.clear(); S.skipped = 0; S.truncated = 0;
+  $('#prog').hidden = true;
   render();
+});
+
+/* 一键重试所有失败项：只重跑失败的地址，已成功的保持不动 */
+$('#retryFail').addEventListener('click', () => {
+  if (S.busy) return;
+  const failed = S.items.filter((x) => !x.ok).map((x) => x.url).filter(Boolean);
+  if (!failed.length) { toast('没有失败项'); return; }
+  toast(`正在重试 ${failed.length} 个失败项…`);
+  run(failed);
 });
 
 $('#selAll').addEventListener('click', () => {

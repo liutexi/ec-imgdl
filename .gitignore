@@ -1,0 +1,4 @@
+cache/*
+!cache/.htaccess
+dist/
+_test_img/
